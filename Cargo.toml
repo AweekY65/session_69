@@ -1,0 +1,7 @@
+[package]
+name = "rvm"
+version = "0.1.0"
+edition = "2021"
+description = "A restricted bytecode VM with a static verifier (no eBPF, no external services)"
+
+[dependencies]

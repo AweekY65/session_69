@@ -1,115 +1,118 @@
-# locallease — 完全本地的 Lease 分布式锁模拟器
+# rvm — 受限字节码虚拟机与静态 verifier
 
-一个纯本地的分布式锁（lease lock）模拟器：多个客户端以 goroutine 形式在同一进程内竞争锁，
-锁状态、租约、fencing token 与审计日志只保存在**本地内存或本地文件**中，
-不依赖 Redis / etcd / ZooKeeper 或任何外部服务。
+一个纯本地、确定性的受限字节码 VM。所有程序、字节码、执行状态和验证
+结果只存在于本地内存或本地文件中：**不依赖 Linux eBPF 子系统、不使
+用远程执行环境、不访问任何外部服务或网络**（无任何第三方依赖，仅使
+用 Rust 标准库）。
 
-## 目录结构
+## 构建与运行
 
-```
-lease/      核心库：Clock、Lease、Manager、Store（内存/文件）、FencedStore、审计日志
-client/     模拟客户端（goroutine），支持 Pause/Resume 模拟进程冻结
-cmd/demo/   可运行演示：暂停-过期-接管-fencing 拒绝 的完整流程
-```
-
-## Lease 状态机
-
-每个资源（resource）在任意时刻**最多存在一个有效 lease**。单个 lease 的状态流转：
-
-```
-                 Acquire 成功
-        (无 lease 或旧 lease 已过期)
-                      │
-                      ▼
-              ┌───────────────┐   Renew 成功(未过期, holder+token 匹配)
-              │     VALID     │ ──────────────────────────┐
-              │ [now, ExpiresAt) │◀────────────────────────┘ (ExpiresAt = now+TTL)
-              └──────┬────────┘
-        Release 成功 │            │ clock.Now() >= ExpiresAt
-                     ▼            ▼
-              ┌───────────────────────┐
-              │   FREE / EXPIRED      │  可被任何人 Acquire 接管（产生新 token）
-              └───────────────────────┘
+```sh
+cargo build
+cargo run --bin vm_test_runner   # 运行全部测试，逐项输出 PASS/FAIL
 ```
 
-规则：
+## ISA
 
-- `Acquire(resource, holder, ttl)`：仅当不存在未过期 lease 时成功；成功即铸造新的 fencing token。
-- `Renew(resource, holder, token, ttl)`：holder 与 token 必须匹配当前 lease，且 `now < ExpiresAt`；
-  **已过期的 lease 永远不能续期**。
-- `Release(resource, holder, token)`：holder 与 token 匹配才删除 lease，否则为失败空操作。
-- 所有状态转移在单个互斥锁下串行化，并**先持久化、后提交内存**。
-
-## Fencing token 原理
-
-仅有过期时间不足以保证安全：持有者可能因 GC 停顿/网络分区“睡过”了自己的租约，
-醒来后锁已被别人接管，若它继续写下游资源就会造成脑裂。解决方案是 fencing token：
-
-1. 每次 `Acquire` 成功，管理器颁发一个**严格递增**的 token（全局计数器，随状态一起持久化，
-   重启后也不会回退）。
-2. 持有者访问下游资源时必须携带自己的 token。
-3. 下游资源（本工程用 `lease.FencedStore` 模拟）只接受**大于已见最大 token** 的写请求。
-
-因此旧持有者醒来后，它的 token 必然小于新持有者的 token，写请求会被拒绝：
+定长 8 字节小端指令编码（借鉴 eBPF 布局，但完全是本地自定义实现）：
 
 ```
-alice: Acquire → token=1 ── 暂停 ──────────→ 醒来: Write(token=1) ✗ 被拒绝 (stale)
-                              bob: Acquire → token=2, Write(token=2) ✓
+byte 0    : opcode
+byte 1    : dst 寄存器(低 4 位) | src 寄存器(高 4 位)
+bytes 2-3 : i16 偏移（跳转偏移或访存偏移）
+bytes 4-7 : i32 立即数
 ```
 
-`client.Client.Write` 演示了携带 token 访问 `FencedStore` 的完整路径。
+### 寄存器
 
-## 时间模型
+- `R0..=R9`：通用 64 位寄存器；`R0` 为返回值寄存器。
+- `R10`：只读栈帧指针（fp），只能作为 load/store 的基址寄存器。
 
-- 所有时间判断都通过可注入的 `lease.Clock` 接口（`Now() time.Time`）完成。
-- 生产/demo 使用 `RealClock`；测试使用 `FakeClock`，通过 `Advance(d)` 手动推进时间。
-- **测试不依赖任何真实 sleep**：租约过期、暂停超时等场景都由 FakeClock 确定性触发。
-- lease 有效期为左闭右开区间 `[AcquiredAt, ExpiresAt)`：到达 `ExpiresAt` 即视为过期。
+### 指令类别
 
-## 持久化与重启
-
-- `lease.FileStore` 将 `{leases, lastToken}` 以 JSON 原子写入本地文件（临时文件 + rename）。
-- 重启后用同一文件构造新的 `Manager`：
-  - 未过期的 lease 正常恢复（持有者可续期，他人无法获取）；
-  - **已过期的 lease 不会被“复活”**——加载时不刷新过期时间，只在操作时按当前时钟惰性判定，
-    因此新持有者可立即接管，旧持有者续期失败；
-  - token 计数器持久化，重启后 token 仍然单调递增。
-
-## 运行测试
-
-```bash
-go test ./...            # 全部测试
-go test -race -count=1 ./...   # 含竞态检测
-go test -v ./lease ./client    # 查看单个场景
-```
-
-测试覆盖（全部使用 FakeClock，无真实 sleep）：
-
-| 场景 | 测试 |
+| 类别 | 指令 |
 |---|---|
-| 竞争获取（并发仅一个赢家） | `TestConcurrentAcquireExactlyOneWinner` / `TestConcurrentClientsSingleWriter` |
-| 续约延长过期时间 | `TestRenewExtendsExpiry` |
-| 错误 holder/token 续期、释放被拒绝 | `TestRenewWithWrongHolderOrTokenFails` 等 |
-| 租约超时后不可续期、可被接管 | `TestExpiredLeaseCannotBeRenewed` / `TestExpiredLeaseTakeover` |
-| 旧客户端暂停恢复 + fencing 拒绝 | `TestPausedClientLosesLeaseAndIsFencedOut` |
-| 短暂暂停后仍可续期 | `TestShortPauseKeepsLease` |
-| token 严格单调（含跨资源、跨重启） | `TestFencingTokenStrictlyIncreasing` / `TestTokenCounterSurvivesRestart` |
-| 释放后重获 | `TestReleaseAndReacquire` / `TestRestartAfterRelease` |
-| 重启恢复/不复活过期 lease | `TestRestartPreservesValidLease` / `TestRestartDoesNotResurrectExpiredLease` |
-| 下游 fencing 存储拒绝旧 token | `TestFencedStoreRejectsStaleTokens` |
+| 算术/逻辑（imm） | `ADD/SUB/MUL/DIV/OR/AND/LSH/RSH/NEG/MOD/XOR/MOV/ARSH64_IMM` |
+| 算术/逻辑（reg） | 同上，`*_REG` 变体 |
+| 无条件跳转 | `JA off` |
+| 条件跳转 | `JEQ/JGT/JGE/JSET/JNE/JSGT/JSGE/JLT/JLE/JSLT/JSLE`（imm 与 reg 变体） |
+| 加载 | `LDXW/LDXH/LDXB/LDXDW`（4/2/1/8 字节） |
+| 存储 | `STX*`（寄存器值）、`ST*`（立即数），宽度同上 |
+| 结束 | `EXIT`（返回 R0） |
 
-## 运行演示
+算术语义：加/减/乘为 64 位回绕（wrapping）运算；除/模遇零触发运行时
+异常；移位量 ≥ 64 触发运行时异常。所有语义与宿主平台无关，保证可重
+现。
 
-```bash
-go run ./cmd/demo -state /tmp/lease-state.json -log /tmp/lease-log.jsonl
+## 验证规则（verifier）
+
+`verify(bytecode, Config)` 是关于字节码与配置的**纯函数**：不读取环
+境变量、时钟、随机源或 I/O，不使用哈希容器，因此同一字节码在任何
+机器、任何时刻的接受/拒绝结果完全一致（确定性由测试
+`verifier_determinism` 覆盖）。
+
+按顺序执行以下静态检查，任一失败即拒绝：
+
+1. **格式**：字节码长度必须是 8 的倍数、非空、不超过
+   `max_program_len`。
+2. **非法 opcode**：未定义的操作码一律拒绝。
+3. **越界寄存器**：寄存器编号必须 < 11；禁止写 R10；R10 不得作为
+   ALU 源操作数或条件跳转操作数。
+4. **栈越界**：以 R10 为基址的访存，偏移必须满足
+   `-stack_size <= off` 且 `off + size <= 0`（偏移是指令内立即数，
+   可完全静态判定）。
+5. **非法跳转**：跳转目标 `pc + 1 + off` 必须落在 `[0, len)` 内。
+6. **循环策略——禁止循环**：所有跳转（含条件跳转）必须严格向前
+   （`off >= 0`）。回跳与自跳一律拒绝。由于每条指令都严格递增
+   pc 且程序有限，终止性得证；配合运行时的 instruction budget 形
+   成双重保险。
+7. **结构**：最后一条指令必须是 `EXIT`；`EXIT` 之后不得存在不可达
+   指令。
+8. **静态可判定的除零**：除以/模以立即数 0 直接拒绝。
+
+## 内存模型
+
+VM 只拥有两块内存，程序无法触及此外的任何地址：
+
+- **栈**：VM 自持的 `stack_size` 字节，经 R10 以负偏移访问
+  `[fp - stack_size, fp)`。verifier 静态检查，运行时再次边界检查。
+- **线性内存**：调用方提供的 `mem_size` 字节缓冲区，经通用寄存器
+  寻址 `[0, mem_size)`。寄存器值在运行时才知道，因此每次 load/store
+  都做运行时边界检查，越界即 `MemOutOfBounds` 异常，绝不读写 VM 分
+  配范围之外的内存。
+
+## 执行限制
+
+- `Config::max_insns`：最大指令执行预算，耗尽即 `BudgetExceeded`，
+  异常程序不可能无限运行。
+- 运行时异常：除零、移位溢出、访存越界、预算耗尽，均以 `RunError`
+  返回，不会 panic 或产生未定义行为。
+
+## 测试方法
+
+不使用 `cargo test`，而是独立终端程序：
+
+```sh
+cargo run --bin vm_test_runner
 ```
 
-输出示例：
+逐项输出 `PASS <name>` / `FAIL <name>: <原因>`，末尾汇总，存在失败
+时以非零码退出。当前覆盖 27 项：
+
+- 合法程序：算术、寄存器运算、线性内存读写、栈读写、条件/带符号跳
+  转；
+- verifier 拒绝：非法 opcode、越界寄存器、写 R10、R10 误用、栈上/
+  下越界、回跳（死循环）、越界跳转、缺少 EXIT、畸形（截断）字节
+  码、立即数除零；
+- 运行时异常：内存越界（正/负地址）、寄存器除零、指令预算耗尽；
+- 算术边界：u64 回绕溢出/下溢、移位溢出、除法边界；
+- 确定性：同一字节码在不同内存内容下反复验证，结果恒定。
+
+## 代码结构
 
 ```
-alice acquire ok=true token=1
-bob acquire ok=true token=2
-alice renew after pause: ok=false (expected failure)
-alice stale write rejected: stale fencing token 1 (already processed token 2)
-alice re-acquire ok=true token=3 (monotonic)
+src/isa.rs               指令编码、opcode 表、汇编辅助函数
+src/verifier.rs          静态 verifier（纯函数）与 Config
+src/vm.rs                虚拟机执行器与运行时边界检查
+src/bin/vm_test_runner.rs 独立测试 runner
 ```
